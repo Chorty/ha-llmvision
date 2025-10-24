@@ -1,15 +1,17 @@
 from datetime import datetime
-from .calendar import Timeline
+from .timeline import Timeline
 from .providers import Request
 from .memory import Memory
 from .media_handlers import MediaProcessor
-import re
-import os
+import os, re
 from datetime import timedelta
 from homeassistant.util import dt as dt_util
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import SupportsResponse
 from homeassistant.exceptions import ServiceValidationError
+import homeassistant.helpers.config_validation as cv
+from .api import TimelineEventView, TimelineEventsView, TimelineEventCreateView
+
 import logging
 
 # Declare variables
@@ -37,7 +39,7 @@ from .const import (
     CONF_AWS_SECRET_ACCESS_KEY,
     CONF_AWS_REGION_NAME,
     MESSAGE,
-    REMEMBER,
+    STORE_IN_TIMELINE,
     USE_MEMORY,
     MODEL,
     PROVIDER,
@@ -67,7 +69,12 @@ from .const import (
     DEFAULT_OPENWEBUI_MODEL,
     CONF_CONTEXT_WINDOW,
     CONF_KEEP_ALIVE,
+    RESPONSE_FORMAT,
+    STRUCTURE,
+    TITLE_FIELD,
 )
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -423,15 +430,14 @@ async def async_migrate_entry(hass, config_entry: ConfigEntry) -> bool:
     return True
 
 
-async def _remember(
+async def _create_event(
     hass,
     call: dict,
     start: datetime,
     response: dict,
     key_frame: str,
-    today_summary: str,
 ) -> None:
-    if call.remember:
+    if call.store_in_timeline:
         # Find timeline config
         config_entry = None
         for entry in hass.config_entries.async_entries(DOMAIN):
@@ -459,14 +465,15 @@ async def _remember(
         else:
             title = "Motion detected"
 
-        await timeline.remember(
+        await timeline.create_event(
             start=start,
             end=dt_util.now() + timedelta(minutes=1),
-            label=title,
-            summary=response["response_text"],
+            title=title,
+            description=response["response_text"],
             key_frame=key_frame,
             camera_name=camera_name,
-            today_summary=today_summary,
+            category="",
+            label="",
         )
 
 
@@ -536,7 +543,7 @@ class ServiceCallData:
         # If not set, the conf_default_model will be set in providers.py
         self.model = data_call.data.get(MODEL)
         self.message = str(data_call.data.get(MESSAGE, "")[0:2000])
-        self.remember = data_call.data.get(REMEMBER, False)
+        self.store_in_timeline = data_call.data.get(STORE_IN_TIMELINE, False)
         self.use_memory = data_call.data.get(USE_MEMORY, False)
         self.image_paths = (
             data_call.data.get(IMAGE_FILE, "").split("\n")
@@ -564,18 +571,23 @@ class ServiceCallData:
         self.expose_images = data_call.data.get(EXPOSE_IMAGES, False)
         self.generate_title = data_call.data.get(GENERATE_TITLE, False)
         self.sensor_entity = data_call.data.get(SENSOR_ENTITY, "")
+        self.response_format = data_call.data.get(RESPONSE_FORMAT, "text")
+        self.structure = data_call.data.get(STRUCTURE, None)
+        self.title_field = data_call.data.get(TITLE_FIELD, "")
 
-        # ------------ Remember ------------
+        # ------------ Create Event ------------
         self.title = data_call.data.get("title")
-        self.summary = data_call.data.get("summary")
-        self.image_path = data_call.data.get("image_path", "")
-        self.camera_entity = data_call.data.get("camera_entity", "")
+        self.description = data_call.data.get("description")
         self.start_time = data_call.data.get("start_time", dt_util.now())
         self.start_time = self._convert_time_input_to_datetime(self.start_time)
         self.end_time = data_call.data.get(
             "end_time", self.start_time + timedelta(minutes=1)
         )
         self.end_time = self._convert_time_input_to_datetime(self.end_time)
+        self.image_path = data_call.data.get("image_path", "")
+        self.camera_entity = data_call.data.get("camera_entity", "")
+        self.category = data_call.data.get("category", "")
+        self.label = data_call.data.get("label", "")
 
         # ------------ Added during call ------------
         # self.base64_images : List[str] = []
@@ -648,13 +660,12 @@ def setup(hass, config):
             _LOGGER.info(f"Key frame: {processor.key_frame}")
             response["key_frame"] = processor.key_frame
 
-        await _remember(
+        await _create_event(
             hass=hass,
             call=call,
             start=start,
             response=response,
             key_frame=processor.key_frame,
-            today_summary=response.get("today_summary", ""),
         )
         return response
 
@@ -687,13 +698,12 @@ def setup(hass, config):
         if processor.key_frame:
             response["key_frame"] = processor.key_frame
 
-        await _remember(
+        await _create_event(
             hass=hass,
             call=call,
             start=start,
             response=response,
             key_frame=processor.key_frame,
-            today_summary=response.get("today_summary", ""),
         )
         return response
 
@@ -729,13 +739,12 @@ def setup(hass, config):
         if processor.key_frame:
             response["key_frame"] = processor.key_frame
 
-        await _remember(
+        await _create_event(
             hass=hass,
             call=call,
             start=start,
             response=response,
             key_frame=processor.key_frame,
-            today_summary=response.get("today_summary", ""),
         )
         return response
 
@@ -809,13 +818,12 @@ def setup(hass, config):
         if processor.key_frame:
             response["key_frame"] = processor.key_frame
 
-        await _remember(
+        await _create_event(
             hass=hass,
             call=call,
             start=start,
             response=response,
             key_frame=processor.key_frame,
-            today_summary=response.get("today_summary", ""),
         )
 
         _LOGGER.debug(f"Response: {response}")
@@ -823,8 +831,8 @@ def setup(hass, config):
         await _update_sensor(hass, sensor_entity, response["response_text"], type)
         return response
 
-    async def remember(data_call):
-        """Handle the service call to remember an event"""
+    async def create_event(data_call):
+        """Handle the service call to create an event"""
         start = dt_util.now()
         call = ServiceCallData(data_call).get_service_call_data()
 
@@ -843,13 +851,15 @@ def setup(hass, config):
 
         timeline = Timeline(hass, config_entry)
 
-        await timeline.remember(
+        await timeline.create_event(
             start=call.start_time,
             end=call.end_time,
-            label=call.title,
-            summary=call.summary,
+            title=call.title,
+            description=call.description,
             key_frame=call.image_path,
             camera_name=call.camera_entity,
+            category=call.category,
+            label=call.label,
         )
 
     # Register actions
@@ -876,8 +886,11 @@ def setup(hass, config):
     )
     hass.services.register(
         DOMAIN,
-        "remember",
-        remember,
+        "create_event",
+        create_event,
     )
+    hass.http.register_view(TimelineEventsView)
+    hass.http.register_view(TimelineEventView)
+    hass.http.register_view(TimelineEventCreateView)
 
     return True
